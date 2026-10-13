@@ -82,54 +82,207 @@ def _validate_olmo3moe_router_selection(router: Any) -> None:
         )
 
 
-def _get_flex_olmo_config(model: MoETransformer) -> PretrainedConfig:
+def _validate_moe_model_for_hf(
+    model: MoETransformer,
+    *,
+    hf_model_type: str,
+    block_type: type,
+    head_qk_norm: bool,
+) -> Dict[str, Any]:
+    """
+    Validate that every block of a (v1) :class:`MoETransformer` computes exactly what the HF
+    ``hf_model_type`` model computes, and collect the config values shared by the HF MoE exporters.
+
+    :raises NotImplementedError: If the model uses a feature the HF model does not implement.
+    """
     blocks = list(model.blocks.values())
+    errors: List[str] = []
+
+    def require(condition: bool, message: str) -> None:
+        if not condition and message not in errors:
+            errors.append(message)
+
+    eps: set = set()
+    signatures = set()
     for block in blocks:
-        if not isinstance(block, MoEReorderedNormTransformerBlock):
-            raise NotImplementedError(
-                f"Block is not a {MoEReorderedNormTransformerBlock.__name__}, unable to build HF config for {model.__class__.__name__}"
+        require(
+            type(block) is block_type,
+            f"block is a {type(block).__name__}; '{hf_model_type}' needs {block_type.__name__}",
+        )
+        attention = getattr(block, "attention", None)
+        moe = getattr(block, "feed_forward_moe", None)
+        require(isinstance(attention, Attention), "the sequence mixer is not standard attention")
+        require(
+            getattr(block, "feed_forward", None) is None,
+            "dense feed-forward layers inside MoE blocks",
+        )
+        require(moe is not None, "a block without a MoE feed-forward")
+        if not isinstance(attention, Attention) or moe is None:
+            continue
+
+        # Attention.
+        require(attention.rope is not None, "attention without RoPE")
+        if attention.rope is not None:
+            require(attention.rope.scaling is None, "RoPE scaling")
+            require(
+                getattr(attention.rope, "rotary_dim", attention.head_dim) == attention.head_dim,
+                "partial rotary embeddings",
+            )
+        require(attention.w_out.bias is None, "attention biases")
+        require(attention.gate is None, "gated attention")
+        require(attention.clip_qkv is None, "clip_qkv")
+        require(not attention.scalable_softmax, "scalable softmax")
+        require(attention.sinks is None, "attention sinks")
+        require(attention.backend.window_size == (-1, -1), "sliding window attention")
+        require(
+            attention.q_norm is not None and attention.k_norm is not None,
+            f"no QK-norm ('{hf_model_type}' always normalizes queries and keys)",
+        )
+        if head_qk_norm:
+            require(
+                bool(attention.use_head_qk_norm),
+                "full-width QK-norm (needs per-head QK-norm, 'use_head_qk_norm=True')",
+            )
+            if attention.q_norm is not None and attention.q_norm.weight is not None:
+                require(
+                    tuple(attention.q_norm.weight.shape) == (attention.head_dim,),
+                    "per-head QK-norm gains (needs one gain shared by all heads)",
+                )
+        else:
+            require(
+                not attention.use_head_qk_norm,
+                "per-head QK-norm (needs full-width QK-norm over all heads)",
             )
 
-        if not isinstance(block.experts.mlp, (DroplessMoEMLP, MoEMLP)):
-            raise NotImplementedError(
-                f"MoE mlp is not a {DroplessMoEMLP.__name__} or {MoEMLP.__name__}, unable to build HF config for {model.__class__.__name__}"
-            )
+        # Norms.
+        for norm in (
+            block.attention_norm,
+            block.feed_forward_norm,
+            attention.q_norm,
+            attention.k_norm,
+        ):
+            if norm is None:
+                continue
+            require(isinstance(norm, RMSNorm), f"{type(norm).__name__} (needs RMSNorm)")
+            require(getattr(norm, "bias", None) is None, "layer-norm biases")
+            eps.add(norm.eps)
 
-        if not isinstance(block.attention, Attention):
-            raise NotImplementedError(
-                f"Attention is not a {Attention.__name__}, unable to build HF config for {model.__class__.__name__}"
+        # MoE.
+        router = moe.router
+        require(moe.shared_mlp is None, f"a shared expert ('{hf_model_type}' has none)")
+        require(getattr(moe, "latent_down_proj", None) is None, "latent MoE projections")
+        require(isinstance(moe.experts.mlp, (DroplessMoEMLP, MoEMLP)), "a non-SwiGLU expert MLP")
+        require(
+            router.gating_function == MoERouterGatingFunction.softmax,
+            f"router gating '{router.gating_function}' (needs softmax)",
+        )
+        require(router.bias_gamma is None, "router score bias ('bias_gamma')")
+        require(
+            not router.uniform_expert_assignment and not router.random_expert_assignment,
+            "uniform/random expert assignment",
+        )
+        require(
+            router.normalize_expert_weights in (None, 1.0),
+            f"'normalize_expert_weights={router.normalize_expert_weights}' "
+            "(only None or 1.0, i.e. 'norm_topk_prob', is supported)",
+        )
+        if not isinstance(moe.experts.mlp, DroplessMoEMLP):
+            log.warning(
+                "Exporting a capacity-based MoE to '%s', which is dropless; outputs differ whenever "
+                "the Olmo-core model drops tokens.",
+                hf_model_type,
             )
-        if block.attention.rope is None:
-            raise NotImplementedError(
-                f"Attention does not use rope, unable to build HF config for {model.__class__.__name__}"
+        signatures.add(
+            (
+                attention.n_heads,
+                attention.n_kv_heads,
+                attention.head_dim,
+                attention.rope.theta if attention.rope is not None else None,
+                moe.router.num_experts,
+                moe.router.top_k,
+                moe.router.normalize_expert_weights,
+                moe.experts.mlp.hidden_size,
             )
+        )
 
-    block = blocks[0]
-    assert isinstance(block, MoEReorderedNormTransformerBlock)
-    assert isinstance(block.attention, Attention)
-    assert block.attention.rope is not None
+    lm_head_norm = getattr(model.lm_head, "norm", None)
+    require(lm_head_norm is not None, "no final norm")
+    if lm_head_norm is not None:
+        require(isinstance(lm_head_norm, RMSNorm), f"{type(lm_head_norm).__name__} (needs RMSNorm)")
+        eps.add(lm_head_norm.eps)
+    require(model.lm_head.w_out.bias is None, "an LM head bias")
+    require(len(signatures) <= 1, "blocks with different attention / MoE shapes")
+    require(len(eps) <= 1, f"different layer-norm eps values {sorted(eps)}")
+    if errors:
+        raise NotImplementedError(
+            f"Unable to build a '{hf_model_type}' HF config for {model.__class__.__name__}: "
+            + "; ".join(errors)
+        )
+
+    (
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        rope_theta,
+        num_experts,
+        top_k,
+        normalize,
+        hidden,
+    ) = signatures.pop()
+    return dict(
+        vocab_size=model.vocab_size,
+        hidden_size=model.d_model,
+        num_hidden_layers=model.n_layers,
+        num_attention_heads=n_heads,
+        num_key_value_heads=n_kv_heads,
+        head_dim=head_dim,
+        rope_theta=rope_theta,
+        rms_norm_eps=eps.pop(),
+        num_experts=num_experts,
+        num_experts_per_tok=top_k,
+        norm_topk_prob=normalize == 1.0,
+        expert_hidden_size=hidden,
+        tie_word_embeddings=model.tie_word_embeddings,
+    )
+
+
+def _get_flex_olmo_config(
+    model: MoETransformer, max_sequence_length: Optional[int] = None
+) -> PretrainedConfig:
+    common = _validate_moe_model_for_hf(
+        model,
+        hf_model_type="flex_olmo",
+        block_type=MoEReorderedNormTransformerBlock,
+        head_qk_norm=False,
+    )
+    if common["head_dim"] * common["num_attention_heads"] != common["hidden_size"]:
+        raise NotImplementedError(
+            "Unable to build a 'flex_olmo' HF config: FlexOlmo requires "
+            "head_dim * n_heads == d_model"
+        )
 
     if FlexOlmoConfig is None:
         raise RuntimeError("The installed transformers version does not support FlexOlmo")
 
     return FlexOlmoConfig(
-        vocab_size=model.vocab_size,
-        hidden_size=model.d_model,
-        intermediate_size=block.feed_forward_moe.experts.mlp.hidden_size,
-        num_hidden_layers=model.n_layers,
-        num_attention_heads=block.attention.n_heads,
-        num_key_value_heads=block.attention.n_kv_heads,
+        vocab_size=common["vocab_size"],
+        hidden_size=common["hidden_size"],
+        intermediate_size=common["expert_hidden_size"],
+        num_hidden_layers=common["num_hidden_layers"],
+        num_attention_heads=common["num_attention_heads"],
+        num_key_value_heads=common["num_key_value_heads"],
         hidden_act="silu",
-        max_position_embeddings=-1,
-        attention_bias=block.attention.w_out.bias is not None,
-        rope_theta=block.attention.rope.theta,
+        max_position_embeddings=max_sequence_length or -1,
+        attention_bias=False,
+        rope_theta=common["rope_theta"],
         pad_token_id=None,  # type: ignore
         bos_token_id=None,
         eos_token_id=None,  # type: ignore
-        rms_norm_eps=block.feed_forward_norm.eps,
-        num_experts_per_tok=block.feed_forward_moe.router.top_k,
-        num_experts=block.feed_forward_moe.router.num_experts,
-        tie_word_embeddings=model.tie_word_embeddings,
+        rms_norm_eps=common["rms_norm_eps"],
+        num_experts_per_tok=common["num_experts_per_tok"],
+        num_experts=common["num_experts"],
+        norm_topk_prob=common["norm_topk_prob"],
+        tie_word_embeddings=common["tie_word_embeddings"],
     )
 
 
@@ -709,7 +862,19 @@ def _get_olmo3moe_kda_emo_config(model: "OLMoDDPModel") -> PretrainedConfig:
 
 
 @beta_feature
-def get_hf_config(model: Transformer) -> PretrainedConfig:
+def get_hf_config(
+    model: Transformer, *, max_sequence_length: Optional[int] = None
+) -> PretrainedConfig:
+    """
+    Build the Hugging Face config for an Olmo-core model.
+
+    :param model: The Olmo-core model.
+    :param max_sequence_length: The value for ``max_position_embeddings``. Currently only used for
+        MoE models; defaults to ``-1`` (unset), in which case the caller must set it before the
+        exported model can be served.
+
+    :raises NotImplementedError: If the model cannot be represented exactly by a HF model.
+    """
     if OLMoDDPModel is not None and isinstance(model, OLMoDDPModel):
         return _get_olmo3moe_config(model)
 
@@ -719,7 +884,7 @@ def get_hf_config(model: Transformer) -> PretrainedConfig:
         )
 
     if isinstance(model, MoETransformer):
-        return _get_flex_olmo_config(model)
+        return _get_flex_olmo_config(model, max_sequence_length)
 
     blocks = list(model.blocks.values())
     first_block = blocks[0]

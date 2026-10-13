@@ -223,6 +223,7 @@ def convert_checkpoint_to_hf(
                 vocab_size=vocab_size,
                 work_dir=work_dir,
                 save_overwrite=True,
+                max_sequence_length=max_sequence_length,
             )
 
         log.info(f"Successfully saved converted model to '{output_path}'")

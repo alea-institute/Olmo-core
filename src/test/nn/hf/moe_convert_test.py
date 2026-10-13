@@ -243,3 +243,37 @@ def test_save_and_load_hf_moe_model(tmp_path, dropless: bool):
     load_hf_model(tmp_path / "hf", target)
     for key, value in state.items():
         torch.testing.assert_close(target[key], value, rtol=0, atol=0, msg=key)
+
+
+def test_save_hf_moe_model_config_fields(tmp_path):
+    from types import SimpleNamespace
+
+    from transformers import AutoConfig, GenerationConfig
+
+    from olmo_core.nn.hf.checkpoint import save_hf_model
+
+    model_config = _tiny_moe_transformer_config(reordered_norm=True)
+    model_config.block.feed_forward_moe.router.normalize_expert_weights = 1.0  # type: ignore[union-attr]
+    model = model_config.build(init_device="cpu")
+    model.init_weights(device=torch.device("cpu"))
+    tokenizer = SimpleNamespace(
+        bos_token_id=None, eos_token_id=1, pad_token_id=2, all_special_tokens=[]
+    )
+    save_hf_model(
+        tmp_path / "hf",
+        model.state_dict(),
+        model,
+        huggingface_tokenizer=tokenizer,
+        max_sequence_length=128,
+    )
+
+    hf_config = AutoConfig.from_pretrained(tmp_path / "hf")
+    assert hf_config.model_type == "flex_olmo"
+    assert hf_config.max_position_embeddings == 128
+    assert hf_config.eos_token_id == 1
+    assert hf_config.pad_token_id == 2
+    assert hf_config.norm_topk_prob is True
+    assert hf_config.num_experts == NUM_EXPERTS
+    assert hf_config.intermediate_size == EXPERT_HIDDEN
+    generation_config = GenerationConfig.from_pretrained(tmp_path / "hf")
+    assert generation_config.eos_token_id == 1

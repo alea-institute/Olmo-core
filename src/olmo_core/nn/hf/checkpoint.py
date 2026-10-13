@@ -160,6 +160,7 @@ def save_hf_model(
     process_group: Optional[dist.ProcessGroup] = None,
     work_dir: Optional[PathOrStr] = None,
     save_overwrite: bool = False,
+    max_sequence_length: Optional[int] = None,
 ):
     """
     Saves an OLMo Core model state dict in Hugging Face transformers format.
@@ -172,9 +173,10 @@ def save_hf_model(
     :param work_dir: A local directory that can be used for holding temporary state. Required when
         downloading a model from a cloud directory.
     :param save_overwrite: Overwrite existing files in ``save_dir``.
+    :param max_sequence_length: Written as ``max_position_embeddings`` (see :func:`get_hf_config`).
     """
 
-    hf_config = get_hf_config(model)
+    hf_config = get_hf_config(model, max_sequence_length=max_sequence_length)
 
     model_state_dict = {key: get_full_tensor(state) for key, state in model_state_dict.items()}
     if dtype is not None:
