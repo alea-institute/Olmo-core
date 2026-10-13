@@ -7,16 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Added
+
+- Added Ulysses context parallelism for `KimiDeltaAttention` (`apply_cp`), mirroring the `GatedDeltaNet` all-to-all head/sequence exchange, with the in-kernel gate parameters sliced to each rank's heads.
+- Added a Ulysses context-parallel parity test for the recurrent mixers (`GatedDeltaNet`, `KimiDeltaAttention`) that compares per-stage activations, outputs, and gradients against a single-process reference, including packed documents that straddle the CP split, plus a model-level gradient-parity test for `gdn` and `kda` under Ulysses CP.
+- Added a Hugging Face Qwen3-MoE exporter: `get_hf_config` (and so `save_hf_model` / `convert_checkpoint_to_hf`) now exports a pre-norm `MoETransformer` as `Qwen3MoeForCausalLM` when it matches it exactly (per-head QK RMSNorm with a shared gain, default RoPE, no biases, softmax top-k router with `norm_topk_prob` from `normalize_expert_weights`, SwiGLU experts, no shared expert, every layer MoE), and refuses anything else. Added `qwen3_moe` state mappings so `load_hf_model` can also import Qwen3-MoE checkpoints. Reordered-norm MoEs still export as FlexOlmo.
+
 ### Fixed
 
 - Fixed the Hugging Face conversion of routed-expert weights for dropless MoEs (`DroplessMoEMLP`). `convert_state_to_hf` and `convert_state_from_hf` assumed the `MoEMLP` layout `(num_experts * d_model, hidden_size)` for `w1`/`w3`, so `save_hf_model` wrote transposed `gate_proj`/`up_proj` tensors for the dropless layout `(num_experts * hidden_size, d_model)`. Both functions now take `dropless_experts`, `convert_state_to_hf` infers the layout from the weight shapes when it is not given (new `infer_dropless_expert_layout`), and `save_hf_model` / `load_hf_model` pick the layout from the model, which replaces the reshape workaround in `convert_checkpoint_to_hf`.
 - Fixed `save_hf_model` and `load_hf_model` for MoE models on `transformers>=5`, which holds the routed experts of the Qwen2-MoE family (FlexOlmo, OLMoE, Qwen3-MoE) as fused `mlp.experts.gate_up_proj` / `mlp.experts.down_proj` tensors in memory. `save_hf_model` loaded per-expert tensors into the model with `load_state_dict` and failed with missing/unexpected keys. Added `fuse_hf_moe_experts`, `unfuse_hf_moe_experts` and `has_fused_hf_moe_experts`; `save_hf_model` fuses when the HF model is fused (checkpoints are still written per expert by `save_pretrained`), and `convert_state_from_hf` accepts both layouts.
 - Fixed the FlexOlmo HF config built by `get_hf_config` for `MoETransformer`: it now sets `norm_topk_prob` from `router.normalize_expert_weights` (previously always the HF default `False`), takes `max_sequence_length` for `max_position_embeddings` (also threaded through `save_hf_model` and `convert_checkpoint_to_hf`; previously `-1`), and refuses models FlexOlmo cannot represent instead of exporting them silently wrong: shared experts, non-softmax gating, router score bias, `normalize_expert_weights` other than `None`/`1.0`, per-head QK-norm, pre-norm blocks, attention gates/sinks/biases/sliding windows, RoPE scaling, latent MoE, non-RMS norms and mixed norm eps. Capacity-based (dropping) MoEs export with a warning.
-
-### Added
-
-- Added Ulysses context parallelism for `KimiDeltaAttention` (`apply_cp`), mirroring the `GatedDeltaNet` all-to-all head/sequence exchange, with the in-kernel gate parameters sliced to each rank's heads.
-- Added a Ulysses context-parallel parity test for the recurrent mixers (`GatedDeltaNet`, `KimiDeltaAttention`) that compares per-stage activations, outputs, and gradients against a single-process reference, including packed documents that straddle the CP split, plus a model-level gradient-parity test for `gdn` and `kda` under Ulysses CP.
 
 ## [v3.0.0](https://github.com/allenai/Olmo-core/releases/tag/v3.0.0) - 2026-09-30
 

@@ -114,7 +114,8 @@ def _with_pre_norm_blocks(config: TransformerConfig) -> None:
         pytest.param(_with_score_bias, "score bias", id="score-bias"),
         pytest.param(_with_l2_normalized_weights, "normalize_expert_weights", id="l2-norm"),
         pytest.param(_with_head_qk_norm, "per-head QK-norm", id="head-qk-norm"),
-        pytest.param(_with_pre_norm_blocks, "MoEReorderedNormTransformerBlock", id="pre-norm"),
+        # Pre-norm MoE blocks are exported as Qwen3-MoE, which needs per-head QK-norm.
+        pytest.param(_with_pre_norm_blocks, "'qwen3_moe'.*full-width QK-norm", id="pre-norm"),
     ],
 )
 def test_get_hf_config_flex_olmo_refuses_unsupported_features(modify, message: str):

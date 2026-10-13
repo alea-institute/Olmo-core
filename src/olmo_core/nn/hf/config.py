@@ -12,7 +12,9 @@ from olmo_core.nn.moe.mlp import DroplessMoEMLP, MoEMLP
 from olmo_core.nn.moe.router import MoERouterGatingFunction
 from olmo_core.nn.rope import RoPEScalingConfig
 from olmo_core.nn.transformer.block import (
+    MoEHybridReorderedNormTransformerBlock,
     MoEReorderedNormTransformerBlock,
+    MoETransformerBlock,
     ReorderedNormTransformerBlock,
     TransformerBlock,
 )
@@ -42,6 +44,11 @@ try:
     from transformers import Olmo3Config  # type: ignore
 except ImportError:
     Olmo3Config = None
+
+try:
+    from transformers import Qwen3MoeConfig  # type: ignore
+except ImportError:
+    Qwen3MoeConfig = None
 
 
 def _validate_olmo3moe_router_selection(router: Any) -> None:
@@ -143,7 +150,11 @@ def _validate_moe_model_for_hf(
                 bool(attention.use_head_qk_norm),
                 "full-width QK-norm (needs per-head QK-norm, 'use_head_qk_norm=True')",
             )
-            if attention.q_norm is not None and attention.q_norm.weight is not None:
+            if (
+                attention.use_head_qk_norm
+                and attention.q_norm is not None
+                and attention.q_norm.weight is not None
+            ):
                 require(
                     tuple(attention.q_norm.weight.shape) == (attention.head_dim,),
                     "per-head QK-norm gains (needs one gain shared by all heads)",
@@ -862,6 +873,53 @@ def _get_olmo3moe_kda_emo_config(model: "OLMoDDPModel") -> PretrainedConfig:
 
 
 @beta_feature
+def _get_qwen3_moe_config(
+    model: MoETransformer, max_sequence_length: Optional[int] = None
+) -> PretrainedConfig:
+    """
+    Build a ``Qwen3MoeConfig`` for a pre-norm :class:`MoETransformer` that computes exactly what
+    ``Qwen3MoeForCausalLM`` computes: pre-norm blocks, per-head QK RMSNorm over ``head_dim`` with a
+    gain shared across heads, default RoPE, no biases, a softmax router over all experts with top-k
+    selection (renormalised iff ``normalize_expert_weights=1.0``, i.e. ``norm_topk_prob``), SwiGLU
+    routed experts, no shared expert, every layer MoE.
+    """
+    common = _validate_moe_model_for_hf(
+        model,
+        hf_model_type="qwen3_moe",
+        block_type=MoETransformerBlock,
+        head_qk_norm=True,
+    )
+    if Qwen3MoeConfig is None:
+        raise RuntimeError("The installed transformers version does not support Qwen3-MoE")
+
+    return Qwen3MoeConfig(
+        vocab_size=common["vocab_size"],
+        hidden_size=common["hidden_size"],
+        intermediate_size=common["expert_hidden_size"],  # unused: every layer is MoE
+        moe_intermediate_size=common["expert_hidden_size"],
+        num_hidden_layers=common["num_hidden_layers"],
+        num_attention_heads=common["num_attention_heads"],
+        num_key_value_heads=common["num_key_value_heads"],
+        head_dim=common["head_dim"],
+        hidden_act="silu",
+        max_position_embeddings=max_sequence_length or -1,
+        rms_norm_eps=common["rms_norm_eps"],
+        rope_theta=common["rope_theta"],
+        attention_bias=False,
+        use_sliding_window=False,
+        decoder_sparse_step=1,
+        mlp_only_layers=[],
+        num_experts=common["num_experts"],
+        num_experts_per_tok=common["num_experts_per_tok"],
+        norm_topk_prob=common["norm_topk_prob"],
+        output_router_logits=False,
+        tie_word_embeddings=common["tie_word_embeddings"],
+        pad_token_id=None,
+        bos_token_id=None,
+        eos_token_id=None,
+    )
+
+
 def get_hf_config(
     model: Transformer, *, max_sequence_length: Optional[int] = None
 ) -> PretrainedConfig:
@@ -872,6 +930,9 @@ def get_hf_config(
     :param max_sequence_length: The value for ``max_position_embeddings``. Currently only used for
         MoE models; defaults to ``-1`` (unset), in which case the caller must set it before the
         exported model can be served.
+
+    A :class:`MoETransformer` with reordered-norm blocks exports to FlexOlmo, one with pre-norm
+    blocks to Qwen3-MoE; both exporters refuse models the HF class cannot represent exactly.
 
     :raises NotImplementedError: If the model cannot be represented exactly by a HF model.
     """
@@ -884,7 +945,13 @@ def get_hf_config(
         )
 
     if isinstance(model, MoETransformer):
-        return _get_flex_olmo_config(model, max_sequence_length)
+        # Pre-norm MoE blocks map to Qwen3-MoE, OLMo-2 style reordered-norm blocks to FlexOlmo.
+        first_block = next(iter(model.blocks.values()))
+        if isinstance(
+            first_block, (MoEReorderedNormTransformerBlock, MoEHybridReorderedNormTransformerBlock)
+        ):
+            return _get_flex_olmo_config(model, max_sequence_length)
+        return _get_qwen3_moe_config(model, max_sequence_length)
 
     blocks = list(model.blocks.values())
     first_block = blocks[0]

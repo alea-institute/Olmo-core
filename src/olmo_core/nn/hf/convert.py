@@ -113,6 +113,9 @@ MODEL_TYPE_SPECIFIC_HF_TO_OLMO_CORE_WEIGHT_MAPPINGS: Dict[str, Dict[str, str]] =
     "qwen3_5_text": {
         f"model.layers.{LAYER}.post_attention_layernorm.weight": f"blocks.{LAYER}.feed_forward_norm.weight"
     },
+    "qwen3_moe": {
+        f"model.layers.{LAYER}.post_attention_layernorm.weight": f"blocks.{LAYER}.feed_forward_norm.weight"
+    },
 }
 
 #: Map of Hugging Face module keys to OLMo Core module keys. This map captures overrides of the standard
@@ -132,6 +135,9 @@ MODEL_TYPE_SPECIFIC_HF_TO_OLMO_CORE_MODULE_MAPPINGS: Dict[str, Dict[str, str]] =
         f"model.layers.{LAYER}.post_attention_layernorm": f"blocks.{LAYER}.feed_forward_norm"
     },
     "qwen3_5_text": {
+        f"model.layers.{LAYER}.post_attention_layernorm": f"blocks.{LAYER}.feed_forward_norm"
+    },
+    "qwen3_moe": {
         f"model.layers.{LAYER}.post_attention_layernorm": f"blocks.{LAYER}.feed_forward_norm"
     },
 }
@@ -329,6 +335,18 @@ MODEL_TYPE_SPECIFIC_OLMO_CORE_TO_HF_TEMPLATE_MAPPINGS: Dict[
         ),
     },
     "qwen3": {
+        f"blocks.{LAYER}.attention_norm.weight": StateMappingTemplate(
+            f"blocks.{LAYER}.attention_norm.weight",
+            f"model.layers.{LAYER}.input_layernorm.weight",
+            state_type=StateType.weight,
+        ),
+        f"blocks.{LAYER}.feed_forward_norm.weight": StateMappingTemplate(
+            f"blocks.{LAYER}.feed_forward_norm.weight",
+            f"model.layers.{LAYER}.post_attention_layernorm.weight",
+            state_type=StateType.weight,
+        ),
+    },
+    "qwen3_moe": {
         f"blocks.{LAYER}.attention_norm.weight": StateMappingTemplate(
             f"blocks.{LAYER}.attention_norm.weight",
             f"model.layers.{LAYER}.input_layernorm.weight",
