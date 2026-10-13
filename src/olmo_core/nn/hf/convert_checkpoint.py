@@ -36,7 +36,7 @@ from olmo_core.nn.moe.moe import MoEType
 from olmo_core.nn.transformer.config import TransformerBlockConfig, TransformerConfig
 from olmo_core.nn.transformer.model import Transformer
 
-from .checkpoint import save_hf_hybrid_model, save_hf_model
+from .checkpoint import add_portable_hf_config_keys, save_hf_hybrid_model, save_hf_model
 from .config import is_olmo_hybrid_model
 from .convert import get_converter_to_hf
 from .tokenizer import export_checkpoint_tokenizer
@@ -239,6 +239,7 @@ def convert_checkpoint_to_hf(
     for name in ("bos_token_id", "eos_token_id", "pad_token_id"):
         setattr(huggingface_config, name, getattr(huggingface_tokenizer, name))
     huggingface_config.save_pretrained(output_path)
+    add_portable_hf_config_keys(output_path)
     log.info(
         "Successfully fixed config using updated config from tokenizer config data and script arguments"
     )

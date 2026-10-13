@@ -1,3 +1,4 @@
+import json
 import logging
 from contextlib import contextmanager
 from pathlib import Path
@@ -42,6 +43,45 @@ except ImportError:
 
 
 log = logging.getLogger(__name__)
+
+
+def add_portable_hf_config_keys(save_dir: PathOrStr) -> None:
+    """
+    Make a locally saved HF ``config.json`` readable by consumers other than ``transformers>=5``
+    (``transformers<5``, and tools that read the hub format such as llama.cpp's converter).
+
+    ``transformers>=5`` writes two values in a form older readers ignore, which then silently fall
+    back to defaults:
+
+    - the RoPE base only inside ``rope_parameters``; older readers use a top-level ``rope_theta``
+      (default ``10000``);
+    - ``Qwen3MoeConfig.num_experts`` under its attribute-map name ``num_local_experts``; older
+      readers use ``num_experts`` (default ``128``).
+
+    This adds the legacy keys next to the new ones, so both generations read the same values.
+
+    :param save_dir: A local directory containing ``config.json``.
+    """
+    path = Path(save_dir) / "config.json"
+    config = json.loads(path.read_text())
+    changed = False
+    rope_parameters = config.get("rope_parameters")
+    if (
+        isinstance(rope_parameters, dict)
+        and rope_parameters.get("rope_theta") is not None
+        and config.get("rope_theta") is None
+    ):
+        config["rope_theta"] = rope_parameters["rope_theta"]
+        changed = True
+    if (
+        config.get("model_type") == "qwen3_moe"
+        and "num_local_experts" in config
+        and "num_experts" not in config
+    ):
+        config["num_experts"] = config["num_local_experts"]
+        changed = True
+    if changed:
+        path.write_text(json.dumps(config, indent=2, sort_keys=True) + "\n")
 
 
 @beta_feature
@@ -284,6 +324,7 @@ def save_hf_model(
         if is_url(save_dir):
             assert work_dir is not None
             hf_model.save_pretrained(work_dir)
+            add_portable_hf_config_keys(work_dir)
 
             copy_dir(work_dir, save_dir, save_overwrite=save_overwrite)
         else:
@@ -292,6 +333,7 @@ def save_hf_model(
                 raise FileExistsError(target)
             target.parent.mkdir(exist_ok=True, parents=True)
             hf_model.save_pretrained(target)
+            add_portable_hf_config_keys(target)
 
 
 @beta_feature

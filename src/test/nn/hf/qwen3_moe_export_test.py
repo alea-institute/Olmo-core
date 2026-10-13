@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 from typing import Callable
 
@@ -157,6 +158,10 @@ def test_save_hf_model_qwen3_moe(tmp_path: Path):
     save_hf_model(tmp_path / "hf", state, model, max_sequence_length=256)
 
     assert AutoConfig.from_pretrained(tmp_path / "hf").model_type == "qwen3_moe"
+    # Readable by transformers<5 and hub-format tools, which only know 'num_experts'.
+    config_json = json.loads((tmp_path / "hf" / "config.json").read_text())
+    assert config_json["num_experts"] == NUM_EXPERTS
+    assert config_json["rope_theta"] == 10_000
     hf_model = AutoModelForCausalLM.from_pretrained(tmp_path / "hf")
     assert type(hf_model).__name__ == "Qwen3MoeForCausalLM"
 
@@ -233,3 +238,27 @@ def test_load_hf_qwen3_moe_model_logits_match(tmp_path: Path, _no_tf32):
     with torch.no_grad():
         hf_logits = hf_model(input_ids=input_ids.to("cuda")).logits
     torch.testing.assert_close(hf_logits, logits, rtol=1e-4, atol=1e-4)
+
+
+def test_add_portable_hf_config_keys(tmp_path: Path):
+    from olmo_core.nn.hf.checkpoint import add_portable_hf_config_keys
+
+    # What transformers>=5 writes for a Qwen3-MoE config.
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "qwen3_moe",
+                "num_local_experts": 16,
+                "rope_parameters": {"rope_theta": 100000.0, "rope_type": "default"},
+            }
+        )
+    )
+    add_portable_hf_config_keys(tmp_path)
+    config = json.loads((tmp_path / "config.json").read_text())
+    assert config["num_experts"] == 16 and config["num_local_experts"] == 16
+    assert config["rope_theta"] == 100000.0
+    assert config["rope_parameters"] == {"rope_theta": 100000.0, "rope_type": "default"}
+
+    # Configs that already carry the legacy keys are left alone.
+    add_portable_hf_config_keys(tmp_path)
+    assert json.loads((tmp_path / "config.json").read_text()) == config
