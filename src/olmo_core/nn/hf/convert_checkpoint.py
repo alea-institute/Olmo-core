@@ -208,22 +208,8 @@ def convert_checkpoint_to_hf(
                 isinstance(model_config.block, TransformerBlockConfig)
                 and (moe_config := model_config.block.feed_forward_moe) is not None
             ):
-                if moe_config.name == MoEType.dropless:
-                    for k, v in model_state_dict.items():
-                        # We need to reshape the w1 and w3 weights for the dropless MoE because conversion
-                        # can't distinguish between dropless and regular MoE, and dropless MoE
-                        # weights are shaped differently to regular MoE.
-                        if k.endswith(".feed_forward_moe.experts.mlp.w1") or k.endswith(
-                            ".feed_forward_moe.experts.mlp.w3"
-                        ):
-                            assert isinstance(v, torch.Tensor), (k, v)
-                            model_state_dict[k] = (
-                                v.reshape(moe_config.num_experts, moe_config.hidden_size, -1)
-                                .permute(0, 2, 1)
-                                .reshape(-1, moe_config.hidden_size)
-                            )
-                            log.info(f"Reshaped {k} because MoE is dropless")
-                elif moe_config.name == MoEType.default:
+                # Dropless expert weights are re-laid out by `save_hf_model` itself.
+                if moe_config.name == MoEType.default:
                     log.warning(
                         f"MoE is {moe_config.name}, which may drop activations and cause validation to fail. You can try mitigating this by setting '--moe-capacity-factor' to a higher value."
                     )

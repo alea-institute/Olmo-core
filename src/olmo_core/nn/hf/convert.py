@@ -1,6 +1,6 @@
 import logging
 import re
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 from transformers import PretrainedConfig
@@ -1117,12 +1117,108 @@ def _convert_state(
     return converter.convert(state, placeholder_bounds)
 
 
+_MOE_EXPERT_KEY_RE = re.compile(r"^blocks\.(\d+)\.feed_forward_moe\.experts\.mlp\.(w1|w2|w3)$")
+
+
+def _get_hf_moe_dims(config: PretrainedConfig) -> Optional[Tuple[int, int, int]]:
+    """
+    Returns ``(num_experts, d_model, expert_hidden_size)`` for a HF MoE config, or ``None`` if the
+    config does not describe a MoE model.
+    """
+    n_experts: int | None = getattr(config, "num_experts", None)
+    if not n_experts:
+        return None
+    expert_hidden_size = getattr(config, "moe_intermediate_size", None) or config.intermediate_size
+    return n_experts, config.hidden_size, expert_hidden_size
+
+
+def infer_dropless_expert_layout(
+    config: PretrainedConfig, olmo_core_state: Dict[str, Any]
+) -> Optional[bool]:
+    """
+    Infer the layout of the routed-expert weights ``feed_forward_moe.experts.mlp.w{1,2,3}`` in an
+    Olmo-core state dict from their shapes.
+
+    The two Olmo-core expert MLPs store ``w1``/``w3`` differently:
+
+    - :class:`~olmo_core.nn.moe.mlp.MoEMLP` stores them as ``(num_experts * d_model, hidden_size)``;
+    - :class:`~olmo_core.nn.moe.mlp.DroplessMoEMLP` stores them as
+      ``(num_experts * hidden_size, d_model)``.
+
+    ``w2`` is ``(num_experts * hidden_size, d_model)`` in both.
+
+    :param config: The Hugging Face config for the model.
+    :param olmo_core_state: An Olmo-core state dict (only tensor shapes are read).
+
+    :returns: ``True`` for the dropless layout, ``False`` for the :class:`~olmo_core.nn.moe.mlp.MoEMLP`
+        layout, or ``None`` if the state has no expert weights or the layout cannot be inferred
+        because ``hidden_size == d_model``.
+
+    :raises ValueError: If the expert weights match neither layout.
+    """
+    dims = _get_hf_moe_dims(config)
+    if dims is None:
+        return None
+    n_experts, d_model, hidden_size = dims
+    for key, state in olmo_core_state.items():
+        match = _MOE_EXPERT_KEY_RE.match(key)
+        if match is None or match.group(2) == "w2":
+            continue
+        shape = tuple(state.shape)
+        if hidden_size == d_model:
+            return None
+        if shape == (n_experts * hidden_size, d_model):
+            return True
+        if shape == (n_experts * d_model, hidden_size):
+            return False
+        raise ValueError(
+            f"Expert weight '{key}' has shape {shape}, which matches neither the dropless layout "
+            f"{(n_experts * hidden_size, d_model)} nor the MoEMLP layout "
+            f"{(n_experts * d_model, hidden_size)}"
+        )
+    return None
+
+
+def _convert_expert_layout(
+    config: PretrainedConfig, olmo_core_state: Dict[str, Any], *, to_dropless: bool
+) -> Dict[str, Any]:
+    """
+    Re-lay out the ``w1``/``w3`` routed-expert weights between the
+    :class:`~olmo_core.nn.moe.mlp.MoEMLP` layout ``(num_experts * d_model, hidden_size)`` (used by the
+    HF mapping templates) and the :class:`~olmo_core.nn.moe.mlp.DroplessMoEMLP` layout
+    ``(num_experts * hidden_size, d_model)``. ``w2`` has the same layout in both and is unchanged.
+    """
+    dims = _get_hf_moe_dims(config)
+    if dims is None:
+        return olmo_core_state
+    n_experts, d_model, hidden_size = dims
+    converted = dict(olmo_core_state)
+    for key, state in olmo_core_state.items():
+        match = _MOE_EXPERT_KEY_RE.match(key)
+        if match is None or match.group(2) == "w2":
+            continue
+        if to_dropless:
+            converted[key] = (
+                state.reshape(n_experts, d_model, hidden_size)
+                .transpose(1, 2)
+                .reshape(n_experts * hidden_size, d_model)
+            )
+        else:
+            converted[key] = (
+                state.reshape(n_experts, hidden_size, d_model)
+                .transpose(1, 2)
+                .reshape(n_experts * d_model, hidden_size)
+            )
+    return converted
+
+
 @beta_feature
 def convert_state_from_hf(
     config: PretrainedConfig,
     hf_state: Dict[str, Any],
     *,
     model_type: str | None = None,
+    dropless_experts: bool = False,
 ) -> Dict[str, Any]:
     """
     Converts a model state dict in Hugging Face transformers format into an unsharded state dict of
@@ -1131,6 +1227,9 @@ def convert_state_from_hf(
     :param config: The Hugging Face config for the model
     :param hf_state: A model state dict in HF format.
     :param model_type: The model type of the HF model.
+    :param dropless_experts: For MoE models, produce routed-expert weights in the
+        :class:`~olmo_core.nn.moe.mlp.DroplessMoEMLP` layout instead of the
+        :class:`~olmo_core.nn.moe.mlp.MoEMLP` layout. See :func:`infer_dropless_expert_layout`.
     """
 
     converter = _get_converter_from_hf(model_type=model_type)
@@ -1145,6 +1244,9 @@ def convert_state_from_hf(
 
     if model_type == "gemma3_text":
         converted_state = _apply_gemma3_norm_transform(converted_state)
+
+    if dropless_experts:
+        converted_state = _convert_expert_layout(config, converted_state, to_dropless=True)
 
     if config.tie_word_embeddings:
         converted_state["lm_head.w_out.weight"] = converted_state["embeddings.weight"]
@@ -1203,7 +1305,10 @@ def _apply_gemma3_norm_inverse_transform(state: Dict[str, Any]) -> Dict[str, Any
 
 @beta_feature
 def convert_state_to_hf(
-    config: PretrainedConfig, olmo_core_state: Dict[str, Any]
+    config: PretrainedConfig,
+    olmo_core_state: Dict[str, Any],
+    *,
+    dropless_experts: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """
     Converts an *unsharded* model state dict of OLMo Core format into Hugging Face transformers format.
@@ -1211,10 +1316,27 @@ def convert_state_to_hf(
     :param config: The Hugging Face config for the model
     :param olmo_core_state: An unsharded OLMo Core model state dict. None of the states can be
         :class:`DTensor` or :class:`ShardedTensor`
+    :param dropless_experts: For MoE models, whether the routed-expert weights are in the
+        :class:`~olmo_core.nn.moe.mlp.DroplessMoEMLP` layout (``True``) or the
+        :class:`~olmo_core.nn.moe.mlp.MoEMLP` layout (``False``). If ``None``, the layout is
+        inferred from the weight shapes with :func:`infer_dropless_expert_layout`, falling back to
+        the :class:`~olmo_core.nn.moe.mlp.MoEMLP` layout (with a warning) when it is ambiguous.
     """
 
     if config.model_type == "olmo3moe":
         return convert_olmo3moe_state_to_hf(config, olmo_core_state)
+
+    if dropless_experts is None and _get_hf_moe_dims(config) is not None:
+        dropless_experts = infer_dropless_expert_layout(config, olmo_core_state)
+        if dropless_experts is None and any(
+            _MOE_EXPERT_KEY_RE.match(key) for key in olmo_core_state
+        ):
+            log.warning(
+                "Cannot infer the routed-expert weight layout because the expert hidden size equals "
+                "d_model; assuming the MoEMLP layout. Pass 'dropless_experts' explicitly."
+            )
+    if dropless_experts:
+        olmo_core_state = _convert_expert_layout(config, olmo_core_state, to_dropless=False)
 
     converter = _get_converter_to_hf(config.model_type)
 

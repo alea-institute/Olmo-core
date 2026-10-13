@@ -23,7 +23,9 @@ from olmo_core.nn.hf.convert import (
     convert_hybrid_state_to_hf,
     convert_state_from_hf,
     convert_state_to_hf,
+    infer_dropless_expert_layout,
 )
+from olmo_core.nn.moe.mlp import DroplessMoEMLP, MoEMLP
 from olmo_core.nn.transformer.model import Transformer
 
 try:
@@ -113,10 +115,19 @@ def load_hf_model(
     log.info(f"Loaded hf model: {hf_model}")
     hf_model.resize_token_embeddings(num_embeddings)
 
+    dropless_experts = infer_dropless_expert_layout(hf_model.config, model_state_dict)
+    if dropless_experts is None and any(
+        ".feed_forward_moe.experts.mlp." in key for key in model_state_dict
+    ):
+        log.warning(
+            "Cannot infer the routed-expert weight layout of the target state dict because the "
+            "expert hidden size equals d_model; assuming the MoEMLP layout."
+        )
     converted_state_dict: Dict[str, torch.Tensor] = convert_state_from_hf(
         hf_model.config,
         hf_model.state_dict(),
         model_type=getattr(hf_model.config, "model_type", None),
+        dropless_experts=bool(dropless_experts),
     )
 
     for key in sorted(converted_state_dict.keys()):
@@ -169,7 +180,25 @@ def save_hf_model(
             key: state.to(dtype=dtype.as_pt()) for key, state in model_state_dict.items()
         }
 
-    hf_state_dict: Dict[str, torch.Tensor] = convert_state_to_hf(hf_config, model_state_dict)
+    expert_mlp_types = {
+        type(module) for module in model.modules() if isinstance(module, (MoEMLP, DroplessMoEMLP))
+    }
+    if len(expert_mlp_types) > 1:
+        raise NotImplementedError(
+            f"Mixed routed-expert MLP types are not supported: {sorted(t.__name__ for t in expert_mlp_types)}"
+        )
+    dropless_experts = DroplessMoEMLP in expert_mlp_types
+    if expert_mlp_types:
+        inferred = infer_dropless_expert_layout(hf_config, model_state_dict)
+        if inferred is not None and inferred != dropless_experts:
+            raise ValueError(
+                "The routed-expert weights in 'model_state_dict' are not in the layout of the "
+                f"model's {next(iter(expert_mlp_types)).__name__} modules"
+            )
+
+    hf_state_dict: Dict[str, torch.Tensor] = convert_state_to_hf(
+        hf_config, model_state_dict, dropless_experts=dropless_experts
+    )
 
     # The custom MoE-v2 mapping includes fused expert tensors, KDA, and optional
     # LatentMoE projections. Verify it as a lossless bijection before writing

@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Fixed
+
+- Fixed the Hugging Face conversion of routed-expert weights for dropless MoEs (`DroplessMoEMLP`). `convert_state_to_hf` and `convert_state_from_hf` assumed the `MoEMLP` layout `(num_experts * d_model, hidden_size)` for `w1`/`w3`, so `save_hf_model` wrote transposed `gate_proj`/`up_proj` tensors for the dropless layout `(num_experts * hidden_size, d_model)`. Both functions now take `dropless_experts`, `convert_state_to_hf` infers the layout from the weight shapes when it is not given (new `infer_dropless_expert_layout`), and `save_hf_model` / `load_hf_model` pick the layout from the model, which replaces the reshape workaround in `convert_checkpoint_to_hf`.
+
 ### Added
 
 - Added Ulysses context parallelism for `KimiDeltaAttention` (`apply_cp`), mirroring the `GatedDeltaNet` all-to-all head/sequence exchange, with the in-kernel gate parameters sliced to each rank's heads.
