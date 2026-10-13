@@ -125,3 +125,121 @@ def test_infer_dropless_expert_layout():
         infer_dropless_expert_layout(
             hf_config, {"blocks.0.feed_forward_moe.experts.mlp.w1": torch.zeros(3, 3)}
         )
+
+
+def _tiny_moe_transformer_config(*, reordered_norm: bool, dropless: bool = True, **kwargs):
+    from olmo_core.nn.transformer.config import TransformerConfig
+
+    return TransformerConfig.llama_like_moe(
+        d_model=D_MODEL,
+        vocab_size=64,
+        n_layers=NUM_LAYERS,
+        n_heads=2,
+        n_kv_heads=kwargs.pop("n_kv_heads", 1),
+        num_experts=NUM_EXPERTS,
+        top_k=2,
+        expert_hidden_size=EXPERT_HIDDEN,
+        dropless=dropless,
+        reordered_norm=reordered_norm,
+        qk_norm=True,
+        layer_norm_eps=1e-6,
+        tie_word_embeddings=kwargs.pop("tie_word_embeddings", False),
+        **kwargs,
+    )
+
+
+def _per_expert_state(hf_model) -> dict:
+    from olmo_core.nn.hf.convert import unfuse_hf_moe_experts
+
+    return unfuse_hf_moe_experts({k: v.detach() for k, v in hf_model.state_dict().items()})
+
+
+def test_fuse_unfuse_hf_moe_experts_roundtrip():
+    from olmo_core.nn.hf.convert import (
+        fuse_hf_moe_experts,
+        has_fused_hf_moe_experts,
+        unfuse_hf_moe_experts,
+    )
+
+    per_expert = {"model.norm.weight": torch.randn(D_MODEL)}
+    for i in range(NUM_LAYERS):
+        for e in range(NUM_EXPERTS):
+            prefix = f"model.layers.{i}.mlp.experts.{e}."
+            per_expert[prefix + "gate_proj.weight"] = torch.randn(EXPERT_HIDDEN, D_MODEL)
+            per_expert[prefix + "up_proj.weight"] = torch.randn(EXPERT_HIDDEN, D_MODEL)
+            per_expert[prefix + "down_proj.weight"] = torch.randn(D_MODEL, EXPERT_HIDDEN)
+
+    fused = fuse_hf_moe_experts(per_expert)
+    assert has_fused_hf_moe_experts(fused) and not has_fused_hf_moe_experts(per_expert)
+    assert fused["model.layers.0.mlp.experts.gate_up_proj"].shape == (
+        NUM_EXPERTS,
+        2 * EXPERT_HIDDEN,
+        D_MODEL,
+    )
+    assert fused["model.layers.0.mlp.experts.down_proj"].shape == (
+        NUM_EXPERTS,
+        D_MODEL,
+        EXPERT_HIDDEN,
+    )
+    roundtrip = unfuse_hf_moe_experts(fused)
+    assert set(roundtrip) == set(per_expert)
+    for key, value in per_expert.items():
+        torch.testing.assert_close(roundtrip[key], value, rtol=0, atol=0)
+
+    del per_expert["model.layers.1.mlp.experts.2.up_proj.weight"]
+    with pytest.raises(ValueError, match="non-contiguous"):
+        fuse_hf_moe_experts(per_expert)
+
+
+def test_fused_hf_moe_experts_match_transformers_layout(tmp_path):
+    """Our fused layout must be the one ``transformers`` uses in memory (when it fuses at all)."""
+    from safetensors.torch import load_file
+    from transformers import AutoModelForCausalLM
+
+    from olmo_core.nn.hf.convert import fuse_hf_moe_experts, has_fused_hf_moe_experts
+
+    hf_model = AutoModelForCausalLM.from_config(_hf_moe_config())
+    in_memory = hf_model.state_dict()
+    if not has_fused_hf_moe_experts(in_memory):
+        pytest.skip("The installed transformers version keeps per-expert tensors in memory")
+    hf_model.save_pretrained(tmp_path)
+    on_disk = load_file(str(tmp_path / "model.safetensors"))
+    assert not has_fused_hf_moe_experts(on_disk)
+    fused = fuse_hf_moe_experts(on_disk)
+    for key, value in in_memory.items():
+        if "lm_head" in key and key not in fused:
+            continue
+        torch.testing.assert_close(fused[key], value, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "dropless", [pytest.param(True, id="dropless"), pytest.param(False, id="moe_mlp")]
+)
+def test_save_and_load_hf_moe_model(tmp_path, dropless: bool):
+    from transformers import AutoModelForCausalLM
+
+    from olmo_core.nn.hf.checkpoint import load_hf_model, save_hf_model
+
+    model = _tiny_moe_transformer_config(reordered_norm=True, dropless=dropless).build(
+        init_device="cpu"
+    )
+    model.init_weights(device=torch.device("cpu"))
+    state = {k: v.detach().clone() for k, v in model.state_dict().items()}
+    save_hf_model(tmp_path / "hf", state, model)
+
+    hf_model = AutoModelForCausalLM.from_pretrained(tmp_path / "hf")
+    hf_state = _per_expert_state(hf_model)
+    x = torch.randn(NUM_EXPERTS, 3, D_MODEL)
+    for i in range(NUM_LAYERS):
+        mlp = model.blocks[str(i)].feed_forward_moe.experts.mlp
+        if dropless:
+            mlp._gmm = None
+        with torch.no_grad():
+            expected = _olmo_core_expert_outputs(mlp, x)
+        torch.testing.assert_close(_hf_expert_outputs(hf_state, i, x), expected)
+
+    # HF -> Olmo-core: the loaded state must equal the original exactly.
+    target = {k: torch.zeros_like(v) for k, v in state.items()}
+    load_hf_model(tmp_path / "hf", target)
+    for key, value in state.items():
+        torch.testing.assert_close(target[key], value, rtol=0, atol=0, msg=key)

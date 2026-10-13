@@ -1212,6 +1212,90 @@ def _convert_expert_layout(
     return converted
 
 
+_HF_FUSED_EXPERTS_RE = re.compile(
+    r"^(?P<prefix>.+\.mlp\.experts)\.(?P<proj>gate_up_proj|down_proj)$"
+)
+_HF_PER_EXPERT_RE = re.compile(
+    r"^(?P<prefix>.+\.mlp\.experts)\.(?P<expert>\d+)\.(?P<proj>gate_proj|up_proj|down_proj)\.weight$"
+)
+
+
+def has_fused_hf_moe_experts(hf_state: Dict[str, Any]) -> bool:
+    """
+    Whether a HF state dict holds routed experts as fused 3D tensors
+    (``mlp.experts.gate_up_proj`` / ``mlp.experts.down_proj``), as ``transformers>=5`` does in memory
+    for the Qwen2-MoE family (Qwen2/3-MoE, OLMoE, FlexOlmo, ...).
+    """
+    return any(_HF_FUSED_EXPERTS_RE.match(key) for key in hf_state)
+
+
+def unfuse_hf_moe_experts(hf_state: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Split fused HF routed-expert tensors into the per-expert layout used by HF checkpoints on disk
+    and by ``transformers<5`` in memory.
+
+    ``mlp.experts.gate_up_proj`` of shape ``(num_experts, 2 * hidden_size, d_model)`` (gate first,
+    then up) becomes ``mlp.experts.{e}.gate_proj.weight`` and ``mlp.experts.{e}.up_proj.weight`` of
+    shape ``(hidden_size, d_model)``, and ``mlp.experts.down_proj`` of shape
+    ``(num_experts, d_model, hidden_size)`` becomes ``mlp.experts.{e}.down_proj.weight``. Other
+    entries are passed through unchanged.
+
+    :param hf_state: A HF state dict.
+
+    :returns: A new state dict with per-expert tensors.
+    """
+    out: Dict[str, Any] = {}
+    for key, value in hf_state.items():
+        match = _HF_FUSED_EXPERTS_RE.match(key)
+        if match is None:
+            out[key] = value
+            continue
+        prefix = match.group("prefix")
+        if match.group("proj") == "gate_up_proj":
+            gate, up = value.chunk(2, dim=1)
+            for e in range(value.shape[0]):
+                out[f"{prefix}.{e}.gate_proj.weight"] = gate[e]
+                out[f"{prefix}.{e}.up_proj.weight"] = up[e]
+        else:
+            for e in range(value.shape[0]):
+                out[f"{prefix}.{e}.down_proj.weight"] = value[e]
+    return out
+
+
+def fuse_hf_moe_experts(hf_state: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Inverse of :func:`unfuse_hf_moe_experts`: stack per-expert HF routed-expert tensors into the
+    fused ``mlp.experts.gate_up_proj`` / ``mlp.experts.down_proj`` tensors that ``transformers>=5``
+    models of the Qwen2-MoE family hold in memory.
+
+    :param hf_state: A HF state dict with per-expert tensors.
+
+    :returns: A new state dict with fused expert tensors.
+
+    :raises ValueError: If the expert indices of a layer are not contiguous from 0.
+    """
+    out: Dict[str, Any] = {}
+    grouped: Dict[str, Dict[str, Dict[int, Any]]] = {}
+    for key, value in hf_state.items():
+        match = _HF_PER_EXPERT_RE.match(key)
+        if match is None:
+            out[key] = value
+            continue
+        grouped.setdefault(match.group("prefix"), {}).setdefault(match.group("proj"), {})[
+            int(match.group("expert"))
+        ] = value
+    for prefix, projs in grouped.items():
+        stacked: Dict[str, torch.Tensor] = {}
+        for proj in ("gate_proj", "up_proj", "down_proj"):
+            experts = projs.get(proj, {})
+            if sorted(experts) != list(range(len(experts))) or not experts:
+                raise ValueError(f"Missing or non-contiguous experts for '{prefix}.*.{proj}'")
+            stacked[proj] = torch.stack([experts[e] for e in range(len(experts))])
+        out[f"{prefix}.gate_up_proj"] = torch.cat([stacked["gate_proj"], stacked["up_proj"]], dim=1)
+        out[f"{prefix}.down_proj"] = stacked["down_proj"]
+    return out
+
+
 @beta_feature
 def convert_state_from_hf(
     config: PretrainedConfig,
@@ -1239,6 +1323,9 @@ def convert_state_from_hf(
 
     if model_type == "olmo3moe":
         return convert_olmo3moe_state_from_hf(config, hf_state)
+
+    if has_fused_hf_moe_experts(hf_state):
+        hf_state = unfuse_hf_moe_experts(hf_state)
 
     converted_state = _convert_state(config, hf_state, converter)
 

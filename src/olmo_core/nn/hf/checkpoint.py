@@ -23,6 +23,8 @@ from olmo_core.nn.hf.convert import (
     convert_hybrid_state_to_hf,
     convert_state_from_hf,
     convert_state_to_hf,
+    fuse_hf_moe_experts,
+    has_fused_hf_moe_experts,
     infer_dropless_expert_layout,
 )
 from olmo_core.nn.moe.mlp import DroplessMoEMLP, MoEMLP
@@ -240,6 +242,18 @@ def save_hf_model(
         log.info("Initializing HF model with empty weights...")
         hf_model = AutoModelForCausalLM.from_config(hf_config)
         del hf_config
+
+    # ``transformers>=5`` holds the routed experts of the Qwen2-MoE family (FlexOlmo, Qwen3-MoE, ...)
+    # as fused 3D tensors in memory; ``save_pretrained`` writes them back in the per-expert layout.
+    hf_model_state = hf_model.state_dict()
+    if has_fused_hf_moe_experts(hf_model_state) and not has_fused_hf_moe_experts(hf_state_dict):
+        hf_state_dict = fuse_hf_moe_experts(hf_state_dict)
+        for key, state in hf_state_dict.items():
+            if key in hf_model_state and hf_model_state[key].shape != state.shape:
+                raise RuntimeError(
+                    f"Fused expert tensor '{key}' has shape {tuple(state.shape)}, but the HF model "
+                    f"expects {tuple(hf_model_state[key].shape)}"
+                )
 
     hf_model.load_state_dict(hf_state_dict, assign=True)
 
